@@ -1,0 +1,393 @@
+---
+title: "Mice Protein Expression"
+author: "Dani Beltrán"
+date: "11 de febrero de 2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+  knitr::opts_chunk$set(echo = TRUE)
+```
+
+\  
+
+## Introduction
+
+\  
+
+The goal of this project is to analyze the data and predict mice genotype, behavior and treatment from the protein expression. It is also determine, in average, how many proteins are necessary to make an accurate prediction. Random forest and Monte Carlo simulations are performed in order to achieve these objectives.
+
+Data can be loaded from the kaggle web page (https://www.kaggle.com/ruslankl/mice-protein-expression). The data set contains 1080 observations with 82 columns: A unique MouseID, the mice genotype (Ts65Dn or Control), behavior (C/S or S/C) and treatment (Memantine or Saline), a summarizing column of the last 3 parameters called "class" and 77 proteins expressions.
+
+This project is contextualized in the Data Science edX course. Specifically, it is the submission for the Capstone Project: IDV Learners section.
+
+\  
+
+## Methods
+
+\  
+
+### Packages and data loading
+
+Packages are loaded
+```{r, message=FALSE, warning=FALSE}
+  if(!require(tidyverse)) install.packages("tidyverse")
+  if(!require(caret)) install.packages("caret")
+  if(!require(gtools)) install.packages("gtools")
+```
+
+Data is loaded from the desktop
+```{r, message=FALSE}
+  library(tidyverse)
+  ds <- read_csv("C:/Users/Desktop/Data_Cortex_Nuclear.csv")
+```
+
+\  
+
+### Data exploration and visualization
+
+First of all, the no protein columns are analyzed.
+
+It is verified that there are no duplicated MouseIDs
+```{r}
+  mean(duplicated(ds$MouseID))
+```
+
+The unique values of the other columns and their quantities are also displayed. No NAs are found.
+```{r}
+  table(ds$Genotype)
+  table(ds$Behavior)
+  table(ds$Treatment)
+  table(ds$class)
+```
+
+As shown, there are 2 genotypes, 2 treatments, 2 behaviors and 8 classes.
+The class column is a summary of de 3 previous columns. Data is analyzed in order to check for contradictions between these columns.
+
+The genotype values (Control and Ts65Dn) are found in the class as "c-x-x"" and "t-x-x". It is verified.
+```{r}
+  table(ds %>% filter(Genotype == "Control") %>% select(class))
+  table(ds %>% filter(Genotype == "Ts65Dn") %>% select(class))
+```
+
+The behavior values (C/S and S/C) are found in the class as "x-CS-x"" and "x-SC-x". It is verified.
+```{r}
+  table(ds %>% filter(Behavior == "C/S") %>% select(class))
+  table(ds %>% filter(Behavior == "S/C") %>% select(class))
+```
+
+The treatment values (Memantine and Saline) are found in the class as "x-x-m" and "x-x-s". It is verified.
+```{r}
+  table(ds %>% filter(Treatment == "Memantine") %>% select(class))
+  table(ds %>% filter(Treatment == "Saline") %>% select(class))
+```
+
+No contradictions are found.
+
+Next, protein columns are analyzed. NAs are quantified in order to know how much data is missing.
+```{r}
+  table(round(unname((unlist(ds %>%
+    select(-MouseID,-Genotype,-Behavior,-Treatment,-class) %>%
+    transmute_all(is.na) %>%
+    summarise_all(mean) ))),4))
+```
+
+There are many columns with exactly the same number of NAs (a very small proportion), many columns with no NAs and just a few with other proportions. Some of them are missing a quarter of the observations. The proportion of NAs in now displayed next to the name of each protein. Proteins with the biggest lack of information are pCFOS_N (6.94%), H3AcK18_N (16.7%), EGR1_N(19.4%), BAD_N (19.7%), H3MeK4_N (25%) and BCL2_N (26.4%). For this reason, these proteins may be problematic predictors.
+```{r}
+  options(dplyr.width = Inf)
+  ds %>%
+    select(-MouseID,-Genotype,-Behavior,-Treatment,-class) %>%
+    transmute_all(is.na) %>%
+    summarise_all(mean)
+```
+
+When we analyze NAs in one of the proteins from the group which is missing a small proportion, we realize that all NAs in this group are from the same observations. They belong to the MouseID 3426_13, 3426_14 and 3426_15.
+```{r}
+  ds %>% select(-Genotype,-Behavior,-Treatment,-class) %>%
+    filter(is.na(BDNF_N))
+```
+
+Also related proteins are searched by correlations.
+
+First of all, proteins are listed and all the possible combinations of pairs of proteins are calculated. There are 2926 possible combinations.
+```{r}
+  proteins <- ds %>% select(-MouseID,-Genotype,-Behavior,-Treatment,-class) %>% names(.)
+  combs <- combinations(length(proteins),2,proteins)
+  nrow(combs)
+```
+
+The correlation of each pair of proteins is calculated. NAs are not taken in count.
+```{r}
+  cors <- vector("numeric")
+  for (i in 1:nrow(combs)){
+    cors[i] <- cor(ds[[combs[i,1]]],ds[[combs[i,2]]], use="complete.obs")
+  }
+```
+
+Distribution of correlations is displayed. Best correlations (>90%) are searched. There are 10 correlations greater than 0.9, one of them is equal to 1. There are no correlations lower than -0.9. The lowest correlations is around -0.7.
+```{r}
+  ggplot(data=as.data.frame(cors),aes(cors)) + geom_histogram(binwidth = 0.04) +
+  xlab("Correlation") + ylab("Count")
+  cors[cors > 0.9]
+  cors[cors < -0.9]
+  min(cors)
+```
+
+The proteins with correlation 1 are found: ARC_N and pS6_N.
+```{r}
+  combs[which(cors>0.99),]
+```
+
+This correlation is visually checked. These 2 proteins have exactly the same values.
+```{r}
+  ds[sample(nrow(ds), 10),] %>% select(ARC_N, pS6_N)
+  sum(ds$ARC_N != ds$pS6_N)
+```
+
+Now, proteins influenced by the mouse parameters (genotype, behavior and treatment) are searched.
+
+The first parameter focused is genotype. Data is grouped by genotype and mean of each group is calculated. Then the total mean is calculated. Finally, standard deviations of grouped data are also calculated.
+```{r}
+  dst1 <- ds %>%
+    select(-MouseID,-Behavior,-Treatment,-class) %>%
+    group_by(Genotype) %>%
+    summarise_all(funs(mean(., na.rm = TRUE))) %>%
+    select(-Genotype)
+  dst2 <- ds %>%
+    select(-MouseID,-Genotype,-Behavior,-Treatment,-class) %>%
+    summarise_all(funs(mean(., na.rm = TRUE)))
+  dst3 <- ds %>%
+    select(-MouseID,-Behavior,-Treatment,-class) %>%
+    group_by(Genotype) %>%
+    summarise_all(funs(sd(., na.rm = TRUE))) %>%
+    select(-Genotype)
+```
+
+A new data frame with genotype related data is set. It includes the means and standard deviations of each group: Control and Ts65Dn. In addition, the difference between the group means divided by the total mean is saved as "meanDiff". It is an indicator of how much different are the means of each group in proportion. Also the mean of the both standard deviations is saved as "meanSD". Finally a new indicator is calculated: "opt". Opt is calculated as the meanDiff divided by the meanSD and it is and indicator of how optimal is this protein to help predict the genotype. High opt values relate to proteins whose groups means are more different and their standard deviations are low.
+```{r}
+  geno <- data.frame( name = proteins,
+    cMean = as.numeric(as.vector(dst1[1,])),
+    tsMean = as.numeric(as.vector(dst1[2,])),
+    meanDiff = abs(as.numeric(as.vector(dst1[1,])) - 
+                   as.numeric(as.vector(dst1[2,])))/as.numeric(as.vector(dst2[1,])),
+    cSD = as.numeric(as.vector(dst3[1,])),
+    tsSD = as.numeric(as.vector(dst3[2,])),
+    meanSD = (as.numeric(as.vector(dst3[1,])) + as.numeric(as.vector(dst3[2,])))/2 ) %>%
+    mutate(opt = meanDiff/meanSD)
+```
+
+The proteins with higher opt values are displayed
+```{r}
+  head(geno %>% select(name,meanDiff,meanSD,opt) %>% arrange(desc(opt)))
+```
+
+The highest opt belongs to the protein APP_N. The distribution of both groups from this protein is displayed.
+```{r}
+  ds %>% ggplot(aes(x=APP_N,fill=Genotype)) + geom_density(alpha=.3) +
+  xlab("APP_N expression") + ylab("Density")
+```
+
+Next, the same genotype analysis is performed with the behavior parameter.
+```{r}
+  dst1 <- ds %>%
+    select(-MouseID,-Genotype,-Treatment,-class) %>%
+    group_by(Behavior) %>%
+    summarise_all(funs(mean(., na.rm = TRUE))) %>%
+    select(-Behavior)
+  dst2 <- ds %>%
+    select(-MouseID,-Genotype,-Behavior,-Treatment,-class) %>%
+    summarise_all(funs(mean(., na.rm = TRUE)))
+  dst3 <- ds %>%
+    select(-MouseID,-Genotype,-Treatment,-class) %>%
+    group_by(Behavior) %>%
+    summarise_all(funs(sd(., na.rm = TRUE))) %>%
+    select(-Behavior)
+  
+  beha <- data.frame( name = proteins,
+    csMean = as.numeric(as.vector(dst1[1,])),
+    scMean = as.numeric(as.vector(dst1[2,])),
+    meanDiff = abs(as.numeric(as.vector(dst1[1,])) - 
+                   as.numeric(as.vector(dst1[2,])))/as.numeric(as.vector(dst2[1,])),
+    csSD = as.numeric(as.vector(dst3[1,])),
+    scSD = as.numeric(as.vector(dst3[2,])),
+    meanSD = (as.numeric(as.vector(dst3[1,])) + as.numeric(as.vector(dst3[2,])))/2 ) %>%
+    mutate(opt = meanDiff/meanSD)
+```
+
+In this case, the "opt" values are quite higher than with the genotype. ARC_N is heading the list.
+```{r}
+  head(beha %>% select(name,meanDiff,meanSD,opt) %>% arrange(desc(opt)))
+```
+
+The distribution of both groups from ARC_N is displayed.
+```{r}
+  ds %>% ggplot(aes(x=ARC_N,fill=Behavior)) + geom_density(alpha=.3) +
+  xlab("ARC_N expression") + ylab("Density")
+```
+
+Finally, the same analysis is repeated with the las parameter: Treatment.
+```{r}
+  dst1 <- ds %>%
+    select(-MouseID,-Genotype,-Behavior,-class) %>%
+    group_by(Treatment) %>%
+    summarise_all(funs(mean(., na.rm = TRUE))) %>%
+    select(-Treatment)
+  dst2 <- ds %>%
+    select(-MouseID,-Genotype,-Behavior,-Treatment,-class) %>%
+    summarise_all(funs(mean(., na.rm = TRUE)))
+  dst3 <- ds %>%
+    select(-MouseID,-Genotype,-Behavior,-class) %>%
+    group_by(Treatment) %>%
+    summarise_all(funs(sd(., na.rm = TRUE))) %>%
+    select(-Treatment)
+  
+  treat <- data.frame( name = proteins,
+    mMean = as.numeric(as.vector(dst1[1,])),
+    sMean = as.numeric(as.vector(dst1[2,])),
+    meanDiff = abs(as.numeric(as.vector(dst1[1,])) - 
+                   as.numeric(as.vector(dst1[2,])))/as.numeric(as.vector(dst2[1,])),
+    mSD = as.numeric(as.vector(dst3[1,])),
+    sSD = as.numeric(as.vector(dst3[2,])),
+    meanSD = (as.numeric(as.vector(dst3[1,])) + as.numeric(as.vector(dst3[2,])))/2 ) %>%
+    mutate(opt = meanDiff/meanSD)
+```
+
+Opt values are similar to the genotype. GFAP_N has achieved the highest value.
+```{r}
+  head(treat %>% select(name,meanDiff,meanSD,opt) %>% arrange(desc(opt)))
+```
+
+The distribution of both groups from GFAP_N is displayed.
+```{r}
+  ds %>% ggplot(aes(x= GFAP_N,fill=Treatment)) + geom_density(alpha=.3) +
+  xlab("GFAP_N expression") + ylab("Density")
+```
+
+As shown in the lasts figures, there is a big overlap region between the groups. Trying to predict the Genotype with the best predictors would be better than guessing but with an important error. However, there are many proteins and all together may be enough to reach an accurate prediction. Therefore, the machine learning strategy for this data will be random forest. It is a suitable method for many predictors.
+
+\  
+
+### Data partition and modeling
+
+Data is split in a train set and a test set, with a 90% and a 10% of the whole data set respectively. The seed is set to 1.
+```{r}
+  set.seed(1)
+  partition <- createDataPartition(y = ds$Genotype, times = 1, p = 0.1, list = FALSE)
+  train <- ds[-partition,]
+  test <- ds[partition,]
+```
+
+The length of each data set is verified.
+```{r}
+  nrow(train)
+  nrow(test)
+```
+
+The random forest package is loaded.
+```{r, message=FALSE, warning=FALSE}
+  if(!require(randomForest)) install.packages("randomForest")
+```
+
+Fit models are developed for the three mice parameters. First, a subset of the train set is made. All not necessary columns are removed and the "y" column is transformed in factors. The model is fit with all the proteins as predictors. NAs are imputed with the median/mode by using the "na.roughfix"" function.
+
+This process is repeated with the genotype,
+```{r}
+  t <- train %>% select(-MouseID,-Behavior,-Treatment,-class) %>% 
+                 mutate(Genotype=as.factor(Genotype))
+  genoFit <- randomForest(Genotype ~ ., data = t, na.action=na.roughfix)
+```
+
+behavior,
+```{r}
+  t <- train %>% select(-MouseID,-Genotype,-Treatment,-class) %>% 
+                 mutate(Behavior=as.factor(Behavior))
+  behaFit <- randomForest(Behavior ~ ., data = t, na.action=na.roughfix)
+```
+
+and treatment.
+```{r}
+  t <- train %>% select(-MouseID,-Genotype,-Behavior,-class) %>% 
+             mutate(Treatment=as.factor(Treatment))
+  treatFit <- randomForest(Treatment ~ ., data = t, na.action=na.roughfix)
+```
+
+Predictions from these 3 models are performed in the results section.
+
+The accuracy of the random forest method is also evaluated with a smaller number of predictors. Monte Carlo simulations are run estimate this accuracy. This is a heavy simulation, so it will be run only with the first parameter: genotype. This parameter has low "opt" values, very similar to the treatment parameter. Genotype and treatment are probably the limiting parameters when looking for the minimum necessary number of proteins to achieve a reasonable accuracy.
+
+Different numbers of random proteins are used as predictors. The mean accuracy of predictions with the same number of predictors are saved. This number of predictors goes from 1 to 77.
+```{r message=FALSE}
+results <- vector("numeric")
+  pnumber <- 1:length(proteins)
+  for (ps in pnumber){
+  
+    r <- replicate(100,{
+      t <- train %>% select(-MouseID,-Behavior,-Treatment,-class) %>% 
+                     mutate(Genotype=as.factor(Genotype)) %>%
+                     select(sample(1:77, ps),78)
+      fit <- randomForest(Genotype ~ ., data = t, na.action=na.roughfix)
+    
+      pred <- predict(fit,  na.roughfix(test[,2:78]))
+      mean(pred==test$Genotype)
+    })
+    
+    # This line is for me to know how is it going
+    message(" || MC Simulation ", ps,"/", length(proteins))
+    
+    results[ps] <- mean(r)
+  }
+```
+
+The results of this simulation are displayed in the results section.
+
+\  
+
+## Results
+
+\  
+
+Fit models are used to predict genotype, behavior and treatment in the validation set. NAs in the validation set are also imputed with the na.roughfix function. Finally, the accuracy with the test set is measured.
+
+Genotype results in a 100% accuracy.
+```{r}
+  genoPred <- predict(genoFit,  na.roughfix(test[,2:78]))
+  mean(genoPred==test$Genotype)
+```
+
+Behavior results in a 100% accuracy.
+```{r}
+  behaPred <- predict(behaFit,  na.roughfix(test[,2:78]))
+  mean(behaPred==test$Behavior)
+```
+
+Treatment results in 100% accuracy.
+```{r}
+  treatPred <- predict(treatFit,  na.roughfix(test[,2:78]))
+  mean(treatPred==test$Treatment)
+```
+
+All parameters are perfectly predicted.
+
+With a lower number of proteins to make the prediction it may result in loss of accuracy. Next figure illustrates how the number of proteins and the accuracy are related.
+```{r}
+ data.frame(proteins=pnumber, accuracy=results) %>% ggplot(aes(proteins,accuracy)) + 
+    geom_point() + geom_vline(xintercept=min(pnumber[results > 0.99]), colour="red") +
+    geom_vline(xintercept=min(pnumber[results > 0.95]), colour="orange") +
+    xlab("Number of proteins") + ylab("Accuracy")
+```
+
+The number of proteins needed to reach a 95% and a 99% of accuracy are displayed.
+```{r}
+  min(pnumber[results > 0.95])
+  min(pnumber[results > 0.99])
+```
+
+\  
+
+## Conclusions
+
+\  
+
+All 3 parameters: genotype, behavior and treatment, can be perfectly predicted from the concentration of proteins found in the data set.
+
+Accuracy increases with the number of proteins used to fit the model in a logarithmic scale. Accuracy higher than 95% can be achieved with around 20 proteins and higher than 99% with around 50 proteins.
